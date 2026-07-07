@@ -36,6 +36,7 @@ export default function App() {
   const localStreamRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastNotifiedRef = useRef({});
+  const monitoringStartTimeRef = useRef(Date.now());
 
   // Real-time Streaming Metrics (derived from WS)
   const [metrics, setMetrics] = useState({
@@ -529,6 +530,15 @@ export default function App() {
     if (appMode === 'browser' && isMonitoring && metrics.faceDetected && !metrics.dndActive) {
       interval = setInterval(() => {
         const now = Date.now();
+        const warmupPassed = (now - monitoringStartTimeRef.current) >= 120000; // 2 minutes (120s)
+        
+        if (!warmupPassed) {
+          lowBpmStartRef.current = null;
+          criticalBpmStartRef.current = null;
+          lowBpmAlertFiredRef.current = false;
+          criticalBpmAlertFiredRef.current = false;
+          return;
+        }
         
         if (metrics.bpm < 12) {
           if (!lowBpmAlertFiredRef.current) {
@@ -575,6 +585,9 @@ export default function App() {
   const toggleMonitoring = () => {
     const nextState = !isMonitoring;
     setIsMonitoring(nextState);
+    if (nextState) {
+      monitoringStartTimeRef.current = Date.now();
+    }
     if (appMode === 'backend') {
       sendWsAction({ action: nextState ? 'start_monitoring' : 'stop_monitoring' });
     }
@@ -595,6 +608,7 @@ export default function App() {
 
   // Restart the entire session
   const handleRestartSession = () => {
+    monitoringStartTimeRef.current = Date.now();
     if (appMode === 'backend') {
       sendWsAction({ action: 'reset_session' });
     } else {
