@@ -56,6 +56,11 @@ export default function App() {
     breakActive: false
   });
 
+  const metricsRef = useRef(metrics);
+  useEffect(() => {
+    metricsRef.current = metrics;
+  }, [metrics]);
+
   // Logs & History Sync
   const [alerts, setAlerts] = useState([]);
   const [metricsHistory, setMetricsHistory] = useState([]);
@@ -422,9 +427,11 @@ export default function App() {
     }
     lastNotifiedRef.current[type] = now;
 
+    const currentBpm = metricsRef.current.bpm;
+
     const alertObj = {
       type,
-      bpm: metrics.bpm,
+      bpm: currentBpm,
       message,
       timestamp: new Date().toISOString()
     };
@@ -527,8 +534,17 @@ export default function App() {
 
   useEffect(() => {
     let interval = null;
-    if (appMode === 'browser' && isMonitoring && metrics.faceDetected && !metrics.dndActive) {
+    if (appMode === 'browser' && isMonitoring) {
       interval = setInterval(() => {
+        const currentMetrics = metricsRef.current;
+        if (!currentMetrics.faceDetected || currentMetrics.dndActive) {
+          lowBpmStartRef.current = null;
+          criticalBpmStartRef.current = null;
+          lowBpmAlertFiredRef.current = false;
+          criticalBpmAlertFiredRef.current = false;
+          return;
+        }
+
         const now = Date.now();
         const warmupPassed = (now - monitoringStartTimeRef.current) >= 120000; // 2 minutes (120s)
         
@@ -540,12 +556,12 @@ export default function App() {
           return;
         }
         
-        if (metrics.bpm < 12) {
+        if (currentMetrics.bpm < 12) {
           if (!lowBpmAlertFiredRef.current) {
             if (!lowBpmStartRef.current) {
               lowBpmStartRef.current = now;
             } else if (now - lowBpmStartRef.current >= 5000) {
-              triggerBrowserAlert('low_bpm', `Low blink rate (${metrics.bpm}/min) detected. Look away for 20s.`);
+              triggerBrowserAlert('low_bpm', `Low blink rate (${currentMetrics.bpm}/min) detected. Look away for 20s.`);
               lowBpmAlertFiredRef.current = true;
               lowBpmStartRef.current = null;
             }
@@ -555,12 +571,12 @@ export default function App() {
           lowBpmAlertFiredRef.current = false;
         }
 
-        if (metrics.bpm < 5) {
+        if (currentMetrics.bpm < 5) {
           if (!criticalBpmAlertFiredRef.current) {
             if (!criticalBpmStartRef.current) {
               criticalBpmStartRef.current = now;
             } else if (now - criticalBpmStartRef.current >= 10000) {
-              triggerBrowserAlert('critical_bpm', `CRITICAL: Extreme low blink rate (${metrics.bpm}/min). Take a break!`);
+              triggerBrowserAlert('critical_bpm', `CRITICAL: Extreme low blink rate (${currentMetrics.bpm}/min). Take a break!`);
               criticalBpmAlertFiredRef.current = true;
               criticalBpmStartRef.current = null;
             }
@@ -579,7 +595,7 @@ export default function App() {
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [appMode, isMonitoring, metrics.faceDetected, metrics.bpm, metrics.dndActive]);
+  }, [appMode, isMonitoring]);
 
   // Toggle monitoring
   const toggleMonitoring = () => {
