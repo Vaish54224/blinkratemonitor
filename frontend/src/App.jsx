@@ -12,6 +12,7 @@ import BreakTimer from './components/BreakTimer';
 import AlertLog from './components/AlertLog';
 import TrendsView from './components/TrendsView';
 import Aperture from './components/Aperture';
+import BrowserDetector from './utils/browserDetector';
 
 export default function App() {
   // Navigation
@@ -19,6 +20,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   // Live WebSocket State
+  const [appMode, setAppMode] = useState('backend'); // 'backend' | 'browser'
   const [isConnected, setIsConnected] = useState(false);
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [isMonitoring, setIsMonitoring] = useState(true);
@@ -26,6 +28,14 @@ export default function App() {
   const [calibrationSeconds, setCalibrationSeconds] = useState(0);
   const [blinkTrigger, setBlinkTrigger] = useState(false);
   const [cameraFrame, setCameraFrame] = useState(null);
+
+  // Browser Mode Refs
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const detectorRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const animationFrameRef = useRef(null);
+  const lastNotifiedRef = useRef({});
 
   // Real-time Streaming Metrics (derived from WS)
   const [metrics, setMetrics] = useState({
@@ -74,6 +84,7 @@ export default function App() {
     wsRef.current.onopen = () => {
       console.log("WebSocket connected.");
       setIsConnected(true);
+      setAppMode('backend');
       setReconnectAttempt(0);
       addToast('System Connected', 'Established contact with background processing service.', 'success');
     };
@@ -189,7 +200,8 @@ export default function App() {
 
     wsRef.current.onclose = () => {
       setIsConnected(false);
-      console.log("WebSocket disconnected.");
+      setAppMode('browser');
+      console.log("WebSocket disconnected. Falling back to browser-only mode.");
       
       setReconnectAttempt(prev => {
         const nextAttempt = prev + 1;
@@ -213,6 +225,14 @@ export default function App() {
   useEffect(() => {
     connectWebSocket();
     
+    // Proactive fallback to browser mode if WS cannot connect within 1.5s
+    const fallbackTimer = setTimeout(() => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        console.log("WS connection timeout. Falling back to Browser Mode.");
+        setAppMode('browser');
+      }
+    }, 1500);
+
     // Request desktop notification permissions
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission().then(permission => {
@@ -220,12 +240,20 @@ export default function App() {
       });
     }
 
+    // Load local history on mount
+    const localAlerts = localStorage.getItem('optic_eye_alerts');
+    const localHistory = localStorage.getItem('optic_eye_metrics_history');
+    if (localAlerts) setAlerts(JSON.parse(localAlerts));
+    if (localHistory) setMetricsHistory(JSON.parse(localHistory));
+
     return () => {
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
       }
       clearTimeout(reconnectTimerRef.current);
+      clearTimeout(fallbackTimer);
+      stopLocalCamera();
     };
   }, []);
 
@@ -253,54 +281,432 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
+  // Browser Mode Helpers & Logic
+  const startLocalCamera = async () => {
+    try {
+      if (!detectorRef.current) {
+        detectorRef.current = new BrowserDetector();
+        addToast('Loading AI Models', 'Initializing MediaPipe Face Landmarker... please wait.', 'info');
+        await detectorRef.current.initialize();
+        addToast('Models Loaded', 'AI Face Tracking is ready.', 'success');
+      }
+
+      // Check if camera stream already exists
+      if (localStreamRef.current) return;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          facingMode: "user"
+        },
+        audio: false
+      });
+
+      localStreamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+
+      startProcessingLoop();
+      setMetrics(prev => ({ ...prev, faceDetected: false }));
+    } catch (err) {
+      console.error("Failed to start local camera:", err);
+      addToast('Camera Access Failed', 'Could not open webcam. Please grant camera permission.', 'error');
+      setIsMonitoring(false);
+    }
+  };
+
+  const stopLocalCamera = () => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  };
+
+  const startProcessingLoop = () => {
+    const loop = (time) => {
+      if (videoRef.current && detectorRef.current && appMode === 'browser' && isMonitoring) {
+        const video = videoRef.current;
+        
+        // Wait until video dimensions are ready
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          const payload = detectorRef.current.processFrame(video, time, (eventData) => {
+            if (eventData.event === 'blink') {
+              setBlinkTrigger(prev => !prev);
+            } else if (eventData.event === 'calibration_progress') {
+              setIsCalibrating(true);
+              setCalibrationSeconds(eventData.secondsLeft);
+            } else if (eventData.event === 'calibration_complete') {
+              setIsCalibrating(false);
+              addToast('Calibration Complete', `EAR Threshold adapted to: ${eventData.earThreshold.toFixed(3)}`, 'success');
+            }
+          });
+
+          if (payload) {
+            setMetrics(prev => ({
+              ...prev,
+              bpm: payload.bpm,
+              totalBlinks: payload.totalBlinks,
+              ear: payload.ear,
+              perclos: payload.perclos,
+              strainScore: payload.strainScore,
+              faceDetected: payload.faceDetected,
+              alertActive: payload.alertActive,
+              headPose: payload.headPose,
+              closeness: payload.closeness,
+              brightness: payload.brightness
+            }));
+
+            setMetricsHistory(prev => {
+              const next = [...prev, {
+                timestamp: payload.timestamp,
+                avg_bpm: payload.bpm,
+                avg_ear: payload.ear,
+                avg_perclos: payload.perclos,
+                avg_posture_score: Math.round(100 - Math.abs(payload.headPose.pitch) - Math.abs(payload.headPose.yaw))
+              }];
+              if (next.length > 60) next.shift();
+              localStorage.setItem('optic_eye_metrics_history', JSON.stringify(next));
+              return next;
+            });
+
+            if (canvasRef.current) {
+              const canvas = canvasRef.current;
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+              const ctx = canvas.getContext('2d');
+              drawLandmarks(ctx, payload.rawLandmarks, canvas.width, canvas.height);
+            }
+          }
+        }
+      }
+      animationFrameRef.current = requestAnimationFrame(loop);
+    };
+    animationFrameRef.current = requestAnimationFrame(loop);
+  };
+
+  const drawLandmarks = (ctx, landmarks, width, height) => {
+    ctx.clearRect(0, 0, width, height);
+    if (!landmarks) return;
+
+    ctx.fillStyle = '#4fd8c4'; // Teal
+    const drawEye = (indices) => {
+      indices.forEach(idx => {
+        const lm = landmarks[idx];
+        const x = lm.x * width;
+        const y = lm.y * height;
+        ctx.beginPath();
+        ctx.arc(x, y, 2.5, 0, 2 * Math.PI);
+        ctx.fill();
+      });
+    };
+
+    drawEye([33, 160, 158, 133, 153, 144]);
+    drawEye([362, 385, 387, 263, 373, 380]);
+  };
+
+  const triggerBrowserAlert = (type, message) => {
+    const now = Date.now();
+    if (lastNotifiedRef.current[type] && (now - lastNotifiedRef.current[type]) < alertCooldown * 60 * 1000) {
+      console.log(`Alert of type ${type} suppressed due to cooldown.`);
+      return;
+    }
+    lastNotifiedRef.current[type] = now;
+
+    const alertObj = {
+      type,
+      bpm: metrics.bpm,
+      message,
+      timestamp: new Date().toISOString()
+    };
+
+    setAlerts(prev => {
+      const next = [alertObj, ...prev];
+      localStorage.setItem('optic_eye_alerts', JSON.stringify(next));
+      return next;
+    });
+
+    addToast(
+      type === 'critical_bpm' ? '⚠️ CRITICAL STRAIN ALERT' : type === 'low_bpm' ? '⚠️ LOW BLINK RATE' : '⏰ BREAK ADVISORY',
+      message,
+      type === 'critical_bpm' ? 'error' : 'warning'
+    );
+
+    if (soundEnabled) {
+      try {
+        const context = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = context.createOscillator();
+        const gain = context.createGain();
+        osc.connect(gain);
+        gain.connect(context.destination);
+
+        if (type === 'critical_bpm') {
+          osc.frequency.setValueAtTime(880, context.currentTime);
+          gain.gain.setValueAtTime(0.1, context.currentTime);
+          osc.start();
+          osc.stop(context.currentTime + 0.15);
+        } else {
+          osc.frequency.setValueAtTime(440, context.currentTime);
+          gain.gain.setValueAtTime(0.1, context.currentTime);
+          osc.start();
+          osc.stop(context.currentTime + 0.1);
+        }
+      } catch (e) {
+        console.warn("Failed to play audio tone", e);
+      }
+    }
+
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try {
+        new Notification(
+          type === 'critical_bpm' ? 'CRITICAL: Extreme Eye Strain Risk' : type === 'low_bpm' ? 'Low Blink Rate Alert' : 'Time to Rest Your Eyes',
+          {
+            body: message,
+            tag: type,
+            renotify: true
+          }
+        );
+      } catch (e) {
+        console.error("Failed to show web notification", e);
+      }
+    }
+  };
+
+  // Browser Mode state hooks
+  useEffect(() => {
+    if (appMode === 'browser') {
+      if (isMonitoring) {
+        startLocalCamera();
+      } else {
+        stopLocalCamera();
+      }
+    }
+    return () => {
+      stopLocalCamera();
+    };
+  }, [appMode, isMonitoring]);
+
+  useEffect(() => {
+    let timer = null;
+    if (appMode === 'browser' && isMonitoring && !metrics.breakActive) {
+      timer = setInterval(() => {
+        setMetrics(prev => {
+          if (prev.pomodoroRemaining <= 1) {
+            triggerBrowserAlert('break_reminder', "Time to rest your eyes (20-20-20 rule)");
+            return {
+              ...prev,
+              pomodoroRemaining: 0,
+              breakActive: true
+            };
+          }
+          return {
+            ...prev,
+            pomodoroRemaining: prev.pomodoroRemaining - 1
+          };
+        });
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [appMode, isMonitoring, metrics.breakActive]);
+
+  const lowBpmStartRef = useRef(null);
+  const criticalBpmStartRef = useRef(null);
+  const lowBpmAlertFiredRef = useRef(false);
+  const criticalBpmAlertFiredRef = useRef(false);
+
+  useEffect(() => {
+    let interval = null;
+    if (appMode === 'browser' && isMonitoring && metrics.faceDetected && !metrics.dndActive) {
+      interval = setInterval(() => {
+        const now = Date.now();
+        
+        if (metrics.bpm < 12) {
+          if (!lowBpmAlertFiredRef.current) {
+            if (!lowBpmStartRef.current) {
+              lowBpmStartRef.current = now;
+            } else if (now - lowBpmStartRef.current >= 5000) {
+              triggerBrowserAlert('low_bpm', `Low blink rate (${metrics.bpm}/min) detected. Look away for 20s.`);
+              lowBpmAlertFiredRef.current = true;
+              lowBpmStartRef.current = null;
+            }
+          }
+        } else {
+          lowBpmStartRef.current = null;
+          lowBpmAlertFiredRef.current = false;
+        }
+
+        if (metrics.bpm < 5) {
+          if (!criticalBpmAlertFiredRef.current) {
+            if (!criticalBpmStartRef.current) {
+              criticalBpmStartRef.current = now;
+            } else if (now - criticalBpmStartRef.current >= 10000) {
+              triggerBrowserAlert('critical_bpm', `CRITICAL: Extreme low blink rate (${metrics.bpm}/min). Take a break!`);
+              criticalBpmAlertFiredRef.current = true;
+              criticalBpmStartRef.current = null;
+            }
+          }
+        } else {
+          criticalBpmStartRef.current = null;
+          criticalBpmAlertFiredRef.current = false;
+        }
+      }, 1000);
+    } else {
+      lowBpmStartRef.current = null;
+      criticalBpmStartRef.current = null;
+      lowBpmAlertFiredRef.current = false;
+      criticalBpmAlertFiredRef.current = false;
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [appMode, isMonitoring, metrics.faceDetected, metrics.bpm, metrics.dndActive]);
+
   // Toggle monitoring
   const toggleMonitoring = () => {
     const nextState = !isMonitoring;
     setIsMonitoring(nextState);
-    sendWsAction({ action: nextState ? 'start_monitoring' : 'stop_monitoring' });
+    if (appMode === 'backend') {
+      sendWsAction({ action: nextState ? 'start_monitoring' : 'stop_monitoring' });
+    }
   };
 
   // Trigger calibration
   const startCalibration = () => {
     setIsCalibrating(true);
-    sendWsAction({ action: 'calibrate' });
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'calibrate' });
+    } else {
+      if (detectorRef.current) {
+        detectorRef.current.startCalibration();
+        setCalibrationSeconds(15);
+      }
+    }
   };
 
   // Restart the entire session
   const handleRestartSession = () => {
-    sendWsAction({ action: 'reset_session' });
-    setAlerts([]);
-    setMetricsHistory([]);
-    setMetrics(prev => ({
-      ...prev,
-      bpm: 15,
-      totalBlinks: 0,
-      ear: 0.24,
-      perclos: 0.05,
-      strainScore: 0,
-      pomodoroRemaining: 1200,
-      breakActive: false
-    }));
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'reset_session' });
+    } else {
+      localStorage.removeItem('optic_eye_alerts');
+      localStorage.removeItem('optic_eye_metrics_history');
+      setAlerts([]);
+      setMetricsHistory([]);
+      
+      if (detectorRef.current) {
+        detectorRef.current.consecutiveClosedFrames = 0;
+        detectorRef.current.blinkTimestamps = [];
+        detectorRef.current.totalBlinks = 0;
+        detectorRef.current.eyeStateHistory = [];
+        detectorRef.current.bpm = 15;
+      }
+      
+      setMetrics(prev => ({
+        ...prev,
+        bpm: 15,
+        totalBlinks: 0,
+        ear: 0.24,
+        perclos: 0.05,
+        strainScore: 0,
+        pomodoroRemaining: 1200,
+        breakActive: false
+      }));
+      addToast('Session Restarted', 'All statistics, timers, and logs have been reset.', 'success');
+    }
+  };
+
+  const handleClearLogs = () => {
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'clear_logs' });
+    } else {
+      localStorage.removeItem('optic_eye_alerts');
+      setAlerts([]);
+      addToast('Database Cleared', 'All logs and alert histories deleted.', 'success');
+    }
+  };
+
+  const handleResolveBreak = () => {
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'take_break_resolved' });
+    } else {
+      setMetrics(prev => ({
+        ...prev,
+        breakActive: false,
+        pomodoroRemaining: 1200
+      }));
+      addToast('Cycle Restarted', 'Break successfully completed. Live monitoring resumed.', 'success');
+    }
+  };
+
+  const handleExportCsv = () => {
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'export_csv' });
+    } else {
+      if (alerts.length === 0) {
+        addToast('Export Failed', 'No alert history available to export.', 'error');
+        return;
+      }
+      let csvContent = "data:text/csv;charset=utf-8,";
+      csvContent += "Timestamp,Alert Type,Blink Rate (BPM),Message\n";
+      alerts.forEach(alert => {
+        const row = `"${alert.timestamp}","${alert.type}",${alert.bpm},"${alert.message.replace(/"/g, '""')}"`;
+        csvContent += row + "\n";
+      });
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement("a");
+      link.setAttribute("href", encodedUri);
+      link.setAttribute("download", "optic_eye_report.csv");
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      addToast('Data Exported', 'Diagnostic log downloaded successfully.', 'success');
+    }
   };
 
   // Sync settings back to backend
   useEffect(() => {
-    sendWsAction({ action: 'set_threshold', threshold: bpmThreshold === 12 ? 0.21 : 0.18 });
-  }, [bpmThreshold]);
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'set_threshold', threshold: bpmThreshold === 12 ? 0.21 : 0.18 });
+    } else {
+      if (detectorRef.current) {
+        detectorRef.current.earThreshold = bpmThreshold === 12 ? 0.21 : 0.18;
+      }
+    }
+  }, [bpmThreshold, appMode]);
 
   useEffect(() => {
-    sendWsAction({ action: 'toggle_dnd', dnd: !dndWindowTracking });
-  }, [dndWindowTracking]);
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'toggle_dnd', dnd: !dndWindowTracking });
+    } else {
+      setMetrics(prev => ({ ...prev, dndActive: !dndWindowTracking }));
+    }
+  }, [dndWindowTracking, appMode]);
 
   useEffect(() => {
-    sendWsAction({ action: 'set_cooldown', cooldown: alertCooldown * 60 });
-  }, [alertCooldown]);
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'set_cooldown', cooldown: alertCooldown * 60 });
+    }
+  }, [alertCooldown, appMode]);
 
   // Update calendar settings
   const handleIcsPathSubmit = (e) => {
     e.preventDefault();
-    sendWsAction({ action: 'set_ics_path', ics_path: icsPath });
-    addToast('Calendar Synced', 'ICS subscription updated in background.', 'success');
+    if (appMode === 'backend') {
+      sendWsAction({ action: 'set_ics_path', ics_path: icsPath });
+      addToast('Calendar Synced', 'ICS subscription updated in background.', 'success');
+    } else {
+      addToast('Not Supported', 'Local calendar sync is only supported in Server Mode.', 'warning');
+    }
   };
 
   return (
@@ -314,7 +720,7 @@ export default function App() {
       >
         {/* Top Header Logo */}
         <div className="p-6 border-b border-white/5 flex items-center space-x-3">
-          <Aperture active={isConnected && isMonitoring} strainScore={metrics.strainScore} blinkTrigger={blinkTrigger} size={36} />
+          <Aperture active={(isConnected || appMode === 'browser') && isMonitoring} strainScore={metrics.strainScore} blinkTrigger={blinkTrigger} size={36} />
           <div>
             <h1 className="text-md font-bold tracking-tight text-[#e8ecf1]">OPTIC EYE</h1>
             <span className="text-[9px] text-[#7a8394] uppercase tracking-widest font-mono-numbers">Diagnostics v1.0</span>
@@ -328,7 +734,12 @@ export default function App() {
             <span className="text-[10px] uppercase font-bold text-[#7a8394] tracking-wider">Device Connection</span>
             <div className="flex items-center justify-between p-3 rounded-xl bg-void/50 border border-white/5">
               <div className="flex items-center space-x-2">
-                {isConnected ? (
+                {appMode === 'browser' ? (
+                  <>
+                    <Shield className="w-4 h-4 text-tear-film animate-pulse" />
+                    <span className="text-xs font-semibold text-[#e8ecf1]">Browser Mode (Active)</span>
+                  </>
+                ) : isConnected ? (
                   <>
                     <Wifi className="w-4 h-4 text-tear-film animate-pulse" />
                     <span className="text-xs font-semibold text-[#e8ecf1]">Connected</span>
@@ -340,7 +751,7 @@ export default function App() {
                   </>
                 )}
               </div>
-              <span className="w-2.5 h-2.5 rounded-full bg-tear-film shadow-[0_0_8px_rgba(79,216,196,0.5)]" />
+              <span className={`w-2.5 h-2.5 rounded-full ${appMode === 'browser' ? 'bg-[#8b7cf6] shadow-[0_0_8px_rgba(139,124,246,0.5)]' : 'bg-tear-film shadow-[0_0_8px_rgba(79,216,196,0.5)]'}`} />
             </div>
           </div>
 
@@ -350,7 +761,21 @@ export default function App() {
             
             {/* Camera Preview Thumbnail */}
             <div className="relative w-full aspect-video rounded-xl bg-void/70 border border-white/5 overflow-hidden flex items-center justify-center">
-              {isMonitoring && cameraFrame ? (
+              {isMonitoring && appMode === 'browser' ? (
+                <div className="relative w-full h-full">
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover -scale-x-100"
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 w-full h-full object-cover -scale-x-100"
+                  />
+                </div>
+              ) : isMonitoring && cameraFrame ? (
                 <img
                   src={`data:image/jpeg;base64,${cameraFrame}`}
                   alt="Camera Preview"
@@ -380,7 +805,7 @@ export default function App() {
             {/* Start/Stop Toggle */}
             <button
               onClick={toggleMonitoring}
-              disabled={!isConnected}
+              disabled={appMode !== 'browser' && !isConnected}
               className={`w-full py-2.5 rounded-xl text-xs font-bold flex items-center justify-center space-x-2 transition-all duration-200 ${
                 isMonitoring 
                   ? 'bg-alert-coral/10 hover:bg-alert-coral/20 text-alert-coral border border-alert-coral/20' 
@@ -403,7 +828,7 @@ export default function App() {
             {/* Calibration sequence */}
             <button
               onClick={startCalibration}
-              disabled={!isConnected || !isMonitoring || isCalibrating}
+              disabled={(appMode !== 'browser' && !isConnected) || !isMonitoring || isCalibrating}
               className="w-full py-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 hover:border-white/15 text-xs font-bold text-[#e8ecf1] flex items-center justify-center space-x-2 transition-all duration-200"
             >
               <RefreshCw className={`w-4 h-4 ${isCalibrating ? 'animate-spin' : ''}`} />
@@ -566,7 +991,7 @@ export default function App() {
                   <BreakTimer
                     pomodoroRemaining={metrics.pomodoroRemaining}
                     breakActive={metrics.breakActive}
-                    onResolveBreak={() => sendWsAction({ action: 'take_break_resolved' })}
+                    onResolveBreak={handleResolveBreak}
                     wsSend={sendWsAction}
                   />
                 </div>
@@ -575,7 +1000,7 @@ export default function App() {
               {/* Alert Journal */}
               <AlertLog
                 alerts={alerts}
-                onClearLogs={() => sendWsAction({ action: 'clear_logs' })}
+                onClearLogs={handleClearLogs}
               />
             </>
           ) : (
@@ -583,7 +1008,7 @@ export default function App() {
               metricsHistory={metricsHistory}
               alerts={alerts}
               wsSend={sendWsAction}
-              onExportCsv={() => sendWsAction({ action: 'export_csv' })}
+              onExportCsv={handleExportCsv}
               dndWindowTracking={dndWindowTracking}
               setDndWindowTracking={setDndWindowTracking}
               calendarSyncEnabled={calendarSyncEnabled}
